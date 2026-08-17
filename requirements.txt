@@ -6,7 +6,7 @@ langchain-openai==0.2.14
 langchain-community==0.3.14
 langgraph==0.2.61
 langfuse==2.51.0
-openai==1.59.0
+openai==1.59.2
 psycopg[binary]==3.2.3
 pgvector==0.3.6
 sqlalchemy==2.0.36
