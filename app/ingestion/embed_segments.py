@@ -69,7 +69,7 @@ async def embed_pending_segments(ctx: dict) -> int:
                 emb_literal = "[" + ",".join(str(x) for x in emb) + "]"
                 conn.execute(
                     text(
-                        "UPDATE transcript_segments SET embedding = :emb::vector, embedding_model = :model WHERE id = :id"
+                        "UPDATE transcript_segments SET embedding = CAST(:emb AS vector), embedding_model = :model WHERE id = :id"
                     ),
                     {"emb": emb_literal, "model": model, "id": seg_id},
                 )
