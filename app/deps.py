@@ -21,6 +21,18 @@ def get_engine():
     return _engine
 
 
+_brain_engine = None
+
+
+def get_brain_engine():
+    global _brain_engine
+    if _brain_engine is None:
+        if not settings.BRAIN_DATABASE_URL:
+            raise RuntimeError("BRAIN_DATABASE_URL is not configured")
+        _brain_engine = create_engine(settings.BRAIN_DATABASE_URL, pool_size=5)
+    return _brain_engine
+
+
 def get_session_factory():
     return sessionmaker(bind=get_engine())
 

@@ -10,7 +10,7 @@ from openai import RateLimitError
 from sqlalchemy import text
 
 from app.config import settings
-from app.deps import get_engine, get_openai_client
+from app.deps import get_brain_engine, get_engine, get_openai_client
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +28,7 @@ async def embed_pending_pdfs(ctx: dict | None = None) -> int:
     Returns the number of successfully ingested PDFs.
     """
     engine = get_engine()
+    brain_engine = get_brain_engine()
     client = get_openai_client()
     model = settings.EMBEDDING_MODEL
     now = datetime.now(timezone.utc)
@@ -55,7 +56,7 @@ async def embed_pending_pdfs(ctx: dict | None = None) -> int:
         """
     )
 
-    with engine.connect() as conn:
+    with brain_engine.connect() as conn:
         rows = conn.execute(select_sql, {"max_retries": _MAX_RETRIES, "limit": _BATCH_SIZE}).mappings().fetchall()
 
     if not rows:
