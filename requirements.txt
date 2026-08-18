@@ -8,6 +8,7 @@ langgraph==0.2.61
 langfuse==2.51.0
 openai==1.59.2
 psycopg[binary]==3.2.3
+psycopg2-binary==2.9.10
 pgvector==0.3.6
 sqlalchemy==2.0.36
 alembic==1.14.0
