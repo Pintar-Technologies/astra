@@ -24,13 +24,12 @@ redis_settings = RedisSettings(
 class WorkerSettings:
     """Arq worker configuration."""
 
-    functions = [
+    cron_jobs = [
         # Deferred to v2.5; see the module comment above.
         # cron(embed_pending_segments, second={0}, keep_result=0),
         cron(embed_pending_pdfs, minute={0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55}, second={15}, keep_result=0),
     ]
     redis_settings = redis_settings
     max_tries = 1  # Let the cron job retry on next cycle
-    max_duration = 300  # 5 minutes max per job
-    keep_result = 0  # Don't keep results
-    keep_result_failed = 3600  # Keep failed results for 1 hour
+    job_timeout = 300  # 5 minutes max per job
+    keep_result = 3600  # Keep results (incl. failed) for 1 hour for debugging
