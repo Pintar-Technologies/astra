@@ -22,7 +22,7 @@ _CHUNK_OVERLAP_CHARS = 240  # ~20% overlap
 _MIN_TEXT_CHARS = 50
 
 
-async def embed_pending_pdfs(ctx: dict) -> int:
+async def embed_pending_pdfs(ctx: dict | None = None) -> int:
     """Arq cron job: download and embed PDFs from lessons without embeddings.
 
     Returns the number of successfully ingested PDFs.
