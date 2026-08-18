@@ -21,6 +21,43 @@ _CHUNK_SIZE_CHARS = 1200  # ~300 tokens
 _CHUNK_OVERLAP_CHARS = 240  # ~20% overlap
 _MIN_TEXT_CHARS = 50
 
+# Idempotent guard so the cron can't crash-loop if the alembic migration
+# hasn't created the rag_* tables yet. Mirrors 0001_initial_rag_tables.py.
+_ENSURE_RAG_TABLES_SQL = text(
+    """
+    CREATE EXTENSION IF NOT EXISTS vector;
+
+    CREATE TABLE IF NOT EXISTS rag_pdf_ingestion_log (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        lesson_id UUID NOT NULL UNIQUE,
+        pdf_hash VARCHAR(64) NOT NULL DEFAULT '',
+        embedded_at TIMESTAMPTZ,
+        status VARCHAR(20) NOT NULL DEFAULT 'PENDING',
+        retry_count INTEGER NOT NULL DEFAULT 0,
+        error_message TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS rag_pdf_chunks (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        lesson_id UUID NOT NULL,
+        module_id UUID,
+        chunk_index INTEGER NOT NULL,
+        page_start INTEGER,
+        page_end INTEGER,
+        text TEXT NOT NULL,
+        embedding vector(1536),
+        embedding_model VARCHAR(50) NOT NULL DEFAULT '',
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        UNIQUE (lesson_id, chunk_index)
+    );
+    """
+)
+
+
+def _ensure_rag_tables(engine) -> None:
+    with engine.begin() as conn:
+        conn.execute(_ENSURE_RAG_TABLES_SQL)
+
 
 async def embed_pending_pdfs(ctx: dict | None = None) -> int:
     """Arq cron job: download and embed PDFs from lessons without embeddings.
@@ -33,31 +70,46 @@ async def embed_pending_pdfs(ctx: dict | None = None) -> int:
     model = settings.EMBEDDING_MODEL
     now = datetime.now(timezone.utc)
 
-    # Fetch lessons with PDFs that haven't been ingested
-    select_sql = text(
+    # Ensure the pgvector rag_* tables exist (idempotent guard against a
+    # missing alembic migration causing a crash-loop).
+    _ensure_rag_tables(engine)
+
+    # Fetch ingestion-log state from the pgvector DB (engine)
+    with engine.connect() as conn:
+        log_rows = conn.execute(
+            text("SELECT lesson_id, status, retry_count FROM rag_pdf_ingestion_log")
+        ).mappings().fetchall()
+    done_ids: set[str] = set()
+    exhausted_ids: set[str] = set()
+    for log_row in log_rows:
+        lid = str(log_row["lesson_id"])
+        if log_row["status"] == "DONE":
+            done_ids.add(lid)
+        elif log_row["status"] == "FAILED" and log_row["retry_count"] >= _MAX_RETRIES:
+            exhausted_ids.add(lid)
+
+    # Fetch candidates from the brain DB (brain_engine) — no cross-db subqueries
+    candidates_sql = text(
         """
         SELECT l.id, l.pdf_url, l.title, sm.module_id
         FROM lessons l
         JOIN sub_modules sm ON l.sub_module_id = sm.id
         WHERE l.pdf_url IS NOT NULL
           AND sm.module_id IS NOT NULL
-          AND l.id NOT IN (
-              SELECT lesson_id
-              FROM rag_pdf_ingestion_log
-              WHERE status = 'DONE'
-          )
-          AND l.id NOT IN (
-              SELECT lesson_id
-              FROM rag_pdf_ingestion_log
-              WHERE status = 'FAILED'
-                AND retry_count >= :max_retries
-          )
-        LIMIT :limit
         """
     )
-
     with brain_engine.connect() as conn:
-        rows = conn.execute(select_sql, {"max_retries": _MAX_RETRIES, "limit": _BATCH_SIZE}).mappings().fetchall()
+        all_candidates = conn.execute(candidates_sql).mappings().fetchall()
+
+    # Filter out already-done / retry-exhausted lessons in Python
+    rows = []
+    for row in all_candidates:
+        lid = str(row["id"])
+        if lid in done_ids or lid in exhausted_ids:
+            continue
+        rows.append(row)
+        if len(rows) >= _BATCH_SIZE:
+            break
 
     if not rows:
         logger.info("No pending PDFs to embed")
