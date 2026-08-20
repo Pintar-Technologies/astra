@@ -33,7 +33,12 @@ def _format_embedding_for_query(emb: list[float]) -> str:
 
 
 def retrieve(state: RAGState) -> dict[str, Any]:
-    """Embed the question and run pgvector similarity search."""
+    """Embed the question and run pgvector similarity search across the
+    brain DB (video transcripts) and the pgvector DB (PDF chunks).
+
+    Each source is queried independently and failures are isolated so a
+    missing column / unreachable DB on one side does not break the other.
+    """
     question = state.get("question", "")
     module_id = state.get("module_id")
     lesson_video_id = state.get("lesson_video_id")
@@ -42,13 +47,14 @@ def retrieve(state: RAGState) -> dict[str, Any]:
     emb = _embed([question])[0]
     emb_literal = _format_embedding_for_query(emb)
 
-    engine = get_engine()
-    brain_engine = get_brain_engine()
+    engine = get_engine()          # pgvector DB (rag_pdf_chunks)
+    brain_engine = get_brain_engine()  # brain DB (transcript_segments, lessons, ...)
 
-    docs = []
+    video_rows: list = []
+    pdf_rows: list = []
 
     if module_id:
-        # module-scoped: video segments (brain DB) + pdf chunks (pgvector DB)
+        # ── Video retrieval (brain DB) ──
         video_sql = text(
             """
             SELECT ts.id::text AS id, ts.text, ts.start_sec, ts.end_sec,
@@ -67,11 +73,18 @@ def retrieve(state: RAGState) -> dict[str, Any]:
             LIMIT :k
             """
         )
-        with brain_engine.connect() as conn:
-            video_rows = conn.execute(
-                video_sql, {"emb": emb_literal, "module_id": module_id, "k": k}
-            ).mappings().fetchall()
+        try:
+            with brain_engine.connect() as conn:
+                video_rows = conn.execute(
+                    video_sql, {"emb": emb_literal, "module_id": module_id, "k": k}
+                ).mappings().fetchall()
+        except Exception as exc:
+            logger.warning(
+                "Video retrieval failed (transcript_segments.embedding may be missing "
+                "or brain DB unreachable): %s", exc
+            )
 
+        # ── PDF retrieval (pgvector DB) ──
         pdf_sql = text(
             """
             SELECT c.id::text AS id, c.text, NULL::int AS start_sec, NULL::int AS end_sec,
@@ -86,33 +99,29 @@ def retrieve(state: RAGState) -> dict[str, Any]:
             LIMIT :k
             """
         )
-        with engine.connect() as conn:
-            pdf_rows = conn.execute(
-                pdf_sql, {"emb": emb_literal, "module_id": module_id, "k": k}
-            ).mappings().fetchall()
+        try:
+            with engine.connect() as conn:
+                pdf_rows = conn.execute(
+                    pdf_sql, {"emb": emb_literal, "module_id": module_id, "k": k}
+                ).mappings().fetchall()
+        except Exception as exc:
+            logger.warning("PDF retrieval failed: %s", exc)
 
-        # Fetch lesson titles from the brain DB (no cross-db join)
-        lesson_ids = sorted({str(r["lesson_id"]) for r in pdf_rows if r["lesson_id"]})
+        # ── Fetch lesson titles from brain DB for PDF docs ──
+        lesson_ids = [r["lesson_id"] for r in pdf_rows if r["lesson_id"]]
         title_map: dict[str, str] = {}
         if lesson_ids:
-            with brain_engine.connect() as conn:
-                title_rows = conn.execute(
-                    text("SELECT id::text AS id, title FROM lessons WHERE id::text = ANY(:ids)"),
-                    {"ids": lesson_ids},
-                ).mappings().fetchall()
-            title_map = {r["id"]: r["title"] for r in title_rows}
-
-        for row in video_rows:
-            d = dict(row)
-            d["score"] = float(1.0 - d.pop("distance", 0.0))
-            docs.append(d)
-        for row in pdf_rows:
-            d = dict(row)
-            d["score"] = float(1.0 - d.pop("distance", 0.0))
-            d["lesson_title"] = title_map.get(row["lesson_id"])
-            docs.append(d)
+            try:
+                with brain_engine.connect() as conn:
+                    title_rows = conn.execute(
+                        text("SELECT id::text AS id, title FROM lessons WHERE id::text = ANY(:ids)"),
+                        {"ids": lesson_ids},
+                    ).mappings().fetchall()
+                title_map = {r["id"]: r["title"] for r in title_rows}
+            except Exception as exc:
+                logger.warning("Lesson title lookup failed: %s", exc)
     else:
-        # video-only scope (brain DB)
+        # ── Video-only retrieval (brain DB) ──
         video_sql = text(
             """
             SELECT ts.id::text AS id, ts.text, ts.start_sec, ts.end_sec,
@@ -131,15 +140,27 @@ def retrieve(state: RAGState) -> dict[str, Any]:
             LIMIT :k
             """
         )
-        with brain_engine.connect() as conn:
-            video_rows = conn.execute(
-                video_sql, {"emb": emb_literal, "lesson_video_id": lesson_video_id, "k": k}
-            ).mappings().fetchall()
+        try:
+            with brain_engine.connect() as conn:
+                video_rows = conn.execute(
+                    video_sql, {"emb": emb_literal, "lesson_video_id": lesson_video_id, "k": k}
+                ).mappings().fetchall()
+        except Exception as exc:
+            logger.warning(
+                "Video retrieval failed (transcript_segments.embedding may be missing "
+                "or brain DB unreachable): %s", exc
+            )
 
-        for row in video_rows:
-            d = dict(row)
-            d["score"] = float(1.0 - d.pop("distance", 0.0))
-            docs.append(d)
+    docs = []
+    for r in video_rows:
+        d = dict(r)
+        d["score"] = float(1.0 - d.pop("distance", 0.0))
+        docs.append(d)
+    for r in pdf_rows:
+        d = dict(r)
+        d["lesson_title"] = title_map.get(r["lesson_id"])
+        d["score"] = float(1.0 - d.pop("distance", 0.0))
+        docs.append(d)
 
     docs.sort(key=lambda x: x["score"], reverse=True)
     docs = docs[:k]
