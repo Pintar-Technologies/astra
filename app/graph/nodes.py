@@ -9,7 +9,7 @@ from openai import RateLimitError
 from sqlalchemy import text
 
 from app.config import settings
-from app.deps import get_engine, get_openai_client, get_openrouter_chat, get_openrouter_client
+from app.deps import get_engine, get_brain_engine, get_openai_client, get_openrouter_chat, get_openrouter_client
 from app.graph.state import RAGState
 
 logger = logging.getLogger(__name__)
@@ -43,51 +43,84 @@ def retrieve(state: RAGState) -> dict[str, Any]:
     emb_literal = _format_embedding_for_query(emb)
 
     engine = get_engine()
+    brain_engine = get_brain_engine()
+
+    docs = []
 
     if module_id:
-        # module-scoped: video segments + pdf chunks
-        sql = text(
-            """
-            (SELECT ts.id::text AS id, ts.text, ts.start_sec, ts.end_sec,
-                    'video' AS source_type,
-                    lv.id::text AS video_id, lv.title AS video_title,
-                    NULL::text AS lesson_id, NULL::text AS lesson_title,
-                    NULL::int AS page_start, NULL::int AS page_end,
-                    ts.embedding <=> :emb AS distance
-             FROM transcript_segments ts
-             JOIN transcripts t ON ts.transcript_id = t.id
-             JOIN lesson_videos lv ON t.lesson_video_id = lv.id
-             WHERE lv.module_id = :module_id
-               AND t.status = 'DONE'
-               AND ts.embedding IS NOT NULL
-             ORDER BY distance
-             LIMIT :k)
-            UNION ALL
-            (SELECT c.id::text, c.text, NULL, NULL, 'pdf',
-                    NULL, NULL,
-                    c.lesson_id::text, l.title,
-                    c.page_start, c.page_end,
-                    c.embedding <=> :emb AS distance
-             FROM rag_pdf_chunks c
-             JOIN lessons l ON c.lesson_id = l.id
-             WHERE c.module_id = :module_id
-             ORDER BY distance
-             LIMIT :k)
-            ORDER BY distance
-            LIMIT :k
-            """
-        )
-        params = {"emb": emb_literal, "module_id": module_id, "k": k}
-    else:
-        # video-only scope
-        sql = text(
+        # module-scoped: video segments (brain DB) + pdf chunks (pgvector DB)
+        video_sql = text(
             """
             SELECT ts.id::text AS id, ts.text, ts.start_sec, ts.end_sec,
                    'video' AS source_type,
                    lv.id::text AS video_id, lv.title AS video_title,
                    NULL::text AS lesson_id, NULL::text AS lesson_title,
                    NULL::int AS page_start, NULL::int AS page_end,
-                   ts.embedding <=> :emb AS distance
+                   ts.embedding <=> CAST(:emb AS vector) AS distance
+            FROM transcript_segments ts
+            JOIN transcripts t ON ts.transcript_id = t.id
+            JOIN lesson_videos lv ON t.lesson_video_id = lv.id
+            WHERE lv.module_id = :module_id
+              AND t.status = 'DONE'
+              AND ts.embedding IS NOT NULL
+            ORDER BY distance
+            LIMIT :k
+            """
+        )
+        with brain_engine.connect() as conn:
+            video_rows = conn.execute(
+                video_sql, {"emb": emb_literal, "module_id": module_id, "k": k}
+            ).mappings().fetchall()
+
+        pdf_sql = text(
+            """
+            SELECT c.id::text AS id, c.text, NULL::int AS start_sec, NULL::int AS end_sec,
+                   'pdf' AS source_type,
+                   NULL::text AS video_id, NULL::text AS video_title,
+                   c.lesson_id::text AS lesson_id, NULL::text AS lesson_title,
+                   c.page_start, c.page_end,
+                   c.embedding <=> CAST(:emb AS vector) AS distance
+            FROM rag_pdf_chunks c
+            WHERE c.module_id = :module_id
+            ORDER BY distance
+            LIMIT :k
+            """
+        )
+        with engine.connect() as conn:
+            pdf_rows = conn.execute(
+                pdf_sql, {"emb": emb_literal, "module_id": module_id, "k": k}
+            ).mappings().fetchall()
+
+        # Fetch lesson titles from the brain DB (no cross-db join)
+        lesson_ids = sorted({str(r["lesson_id"]) for r in pdf_rows if r["lesson_id"]})
+        title_map: dict[str, str] = {}
+        if lesson_ids:
+            with brain_engine.connect() as conn:
+                title_rows = conn.execute(
+                    text("SELECT id::text AS id, title FROM lessons WHERE id::text = ANY(:ids)"),
+                    {"ids": lesson_ids},
+                ).mappings().fetchall()
+            title_map = {r["id"]: r["title"] for r in title_rows}
+
+        for row in video_rows:
+            d = dict(row)
+            d["score"] = float(1.0 - d.pop("distance", 0.0))
+            docs.append(d)
+        for row in pdf_rows:
+            d = dict(row)
+            d["score"] = float(1.0 - d.pop("distance", 0.0))
+            d["lesson_title"] = title_map.get(row["lesson_id"])
+            docs.append(d)
+    else:
+        # video-only scope (brain DB)
+        video_sql = text(
+            """
+            SELECT ts.id::text AS id, ts.text, ts.start_sec, ts.end_sec,
+                   'video' AS source_type,
+                   lv.id::text AS video_id, lv.title AS video_title,
+                   NULL::text AS lesson_id, NULL::text AS lesson_title,
+                   NULL::int AS page_start, NULL::int AS page_end,
+                   ts.embedding <=> CAST(:emb AS vector) AS distance
             FROM transcript_segments ts
             JOIN transcripts t ON ts.transcript_id = t.id
             JOIN lesson_videos lv ON t.lesson_video_id = lv.id
@@ -98,16 +131,18 @@ def retrieve(state: RAGState) -> dict[str, Any]:
             LIMIT :k
             """
         )
-        params = {"emb": emb_literal, "lesson_video_id": lesson_video_id, "k": k}
+        with brain_engine.connect() as conn:
+            video_rows = conn.execute(
+                video_sql, {"emb": emb_literal, "lesson_video_id": lesson_video_id, "k": k}
+            ).mappings().fetchall()
 
-    with engine.connect() as conn:
-        rows = conn.execute(sql, params).mappings().fetchall()
+        for row in video_rows:
+            d = dict(row)
+            d["score"] = float(1.0 - d.pop("distance", 0.0))
+            docs.append(d)
 
-    docs = []
-    for row in rows:
-        d = dict(row)
-        d["score"] = float(1.0 - d.pop("distance", 0))
-        docs.append(d)
+    docs.sort(key=lambda x: x["score"], reverse=True)
+    docs = docs[:k]
 
     logger.info("Retrieved %d docs (module_id=%s, video=%s)", len(docs), module_id, lesson_video_id)
     return {"retrieved_docs": docs}
