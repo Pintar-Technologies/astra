@@ -7,7 +7,7 @@ from openai import RateLimitError
 from sqlalchemy import text
 
 from app.config import settings
-from app.deps import get_engine, get_openai_client
+from app.deps import get_engine, get_brain_engine, get_openai_client
 
 logger = logging.getLogger(__name__)
 
@@ -21,11 +21,17 @@ async def embed_pending_segments(ctx: dict) -> int:
     Returns the number of segments successfully embedded.
     """
     engine = get_engine()
+    brain_engine = get_brain_engine()
     client = get_openai_client()
     model = settings.EMBEDDING_MODEL
     now = datetime.now(timezone.utc)
 
-    # Fetch pending segments
+    # Idempotent guard: ensure the embedding column exists on the brain-owned table
+    with brain_engine.begin() as conn:
+        conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+        conn.execute(text("ALTER TABLE transcript_segments ADD COLUMN IF NOT EXISTS embedding vector(1536)"))
+
+    # Fetch pending segments (transcript_segments + transcripts live in the brain DB)
     select_sql = text(
         """
         SELECT ts.id, ts.text
@@ -33,22 +39,26 @@ async def embed_pending_segments(ctx: dict) -> int:
         JOIN transcripts t ON ts.transcript_id = t.id
         WHERE t.status = 'DONE'
           AND ts.embedding IS NULL
-          AND ts.id NOT IN (
-              SELECT transcript_segment_id
-              FROM rag_ingestion_log
-              WHERE source_type = 'segment'
-                AND status = 'FAILED'
-                AND retry_count >= :max_retries
-          )
         LIMIT :limit
         """
     )
 
+    with brain_engine.connect() as conn:
+        rows = conn.execute(select_sql, {"limit": _BATCH_SIZE}).mappings().fetchall()
+
+    # Exclude already-failed segments (rag_ingestion_log lives in the pgvector DB)
     with engine.connect() as conn:
-        rows = conn.execute(select_sql, {"max_retries": _MAX_RETRIES, "limit": _BATCH_SIZE}).mappings().fetchall()
+        failed_rows = conn.execute(
+            text(
+                "SELECT transcript_segment_id FROM rag_ingestion_log WHERE source_type = 'segment' AND status = 'FAILED' AND retry_count >= :max_retries"
+            ),
+            {"max_retries": _MAX_RETRIES},
+        ).mappings().fetchall()
+    failed_ids = {str(r["transcript_segment_id"]) for r in failed_rows}
+    rows = [r for r in rows if str(r["id"]) not in failed_ids]
 
     if not rows:
-        logger.info("No pending segments to embed")
+        logger.info("No pending segments after retry-filter")
         return 0
 
     ids = [str(r["id"]) for r in rows]
@@ -64,7 +74,7 @@ async def embed_pending_segments(ctx: dict) -> int:
         embeddings = [d.embedding for d in resp.data]
 
         # Update transcript_segments (brain-owned table — allowed write exception)
-        with engine.begin() as conn:
+        with brain_engine.begin() as conn:
             for seg_id, emb in zip(ids, embeddings):
                 emb_literal = "[" + ",".join(str(x) for x in emb) + "]"
                 conn.execute(

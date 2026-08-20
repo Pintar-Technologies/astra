@@ -6,12 +6,11 @@ from arq.connections import RedisSettings
 from app.config import settings
 from app.ingestion.embed_pdfs import embed_pending_pdfs
 
-# Transcript embedding is intentionally deferred to v2.5.  The transcript
-# tables belong to brain's database, while this deployment's DATABASE_URL
-# points at the astra-owned pgvector database.  Do not re-enable this cron
-# until the two-database write path (or an internal astra embedding endpoint)
-# is implemented and verified.
-# from app.ingestion.embed_segments import embed_pending_segments
+# Transcript segment embedding (v2.5): embed_pending_segments writes embeddings
+# back to brain's transcript_segments.embedding column via get_brain_engine()
+# (the two-database write path). The column is provisioned idempotently by both
+# brain's migration and this cron's guard.
+from app.ingestion.embed_segments import embed_pending_segments
 
 redis_settings = RedisSettings(
     host=settings.REDIS_HOST,
@@ -25,8 +24,7 @@ class WorkerSettings:
     """Arq worker configuration."""
 
     cron_jobs = [
-        # Deferred to v2.5; see the module comment above.
-        # cron(embed_pending_segments, second={0}, keep_result=0),
+        cron(embed_pending_segments, minute={0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55}, second={45}, keep_result=0),
         cron(embed_pending_pdfs, minute={0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55}, second={15}, keep_result=0),
     ]
     redis_settings = redis_settings
