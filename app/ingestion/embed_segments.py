@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import uuid
 from datetime import datetime, timezone
 
 from openai import RateLimitError
@@ -106,16 +107,8 @@ def _insert_pending_logs(engine, ids: list[str], model: str):
     """Insert rag_ingestion_log rows with status PROCESSING."""
     with engine.begin() as conn:
         for seg_id in ids:
-            conn.execute(
-                text(
-                    """
-                    INSERT INTO rag_ingestion_log (transcript_segment_id, source_type, embedding_model, status)
-                    VALUES (:seg_id, 'segment', :model, 'PROCESSING')
-                    ON CONFLICT DO NOTHING
-                    """
-                ),
-                {"seg_id": seg_id, "model": model},
-            )
+            seg_pk = str(uuid.uuid4())
+            conn.execute(text("INSERT INTO rag_ingestion_log (id, transcript_segment_id, source_type, embedding_model, status) VALUES (:id, :seg_id, 'segment', :model, 'PROCESSING') ON CONFLICT DO NOTHING"), {"id": seg_pk, "seg_id": seg_id, "model": model})
 
 
 def _update_logs_done(engine, ids: list[str], now: datetime):
