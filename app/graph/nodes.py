@@ -154,12 +154,17 @@ def retrieve(state: RAGState) -> dict[str, Any]:
     docs = []
     for r in video_rows:
         d = dict(r)
-        d["score"] = float(1.0 - d.pop("distance", 0.0))
+        raw = d.pop("distance", 0.0)
+        # pgvector distance may come back as Decimal; coerce via float
+        score = (1.0 - float(raw)) if raw is not None else None
+        d["score"] = float(score) if score is not None else None
         docs.append(d)
     for r in pdf_rows:
         d = dict(r)
         d["lesson_title"] = title_map.get(r["lesson_id"])
-        d["score"] = float(1.0 - d.pop("distance", 0.0))
+        raw = d.pop("distance", 0.0)
+        score = (1.0 - float(raw)) if raw is not None else None
+        d["score"] = float(score) if score is not None else None
         docs.append(d)
 
     docs.sort(key=lambda x: x["score"], reverse=True)

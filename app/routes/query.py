@@ -33,7 +33,7 @@ async def verify_internal_key(internal_api_key: str = Header("", alias="INTERNAL
 
 
 def _sse_frame(event: str, data: dict) -> str:
-    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False, default=str)}\n\n"
 
 
 # ── Streaming endpoint ─────────────────────────────────────────────────────
