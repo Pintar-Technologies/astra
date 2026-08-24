@@ -267,8 +267,8 @@ async def _process_single_pdf(
             conn.execute(
                 text(
                     """
-                    INSERT INTO rag_pdf_chunks (lesson_id, module_id, chunk_index, page_start, page_end, text, embedding, embedding_model)
-                    VALUES (:lesson_id, :module_id, :chunk_index, :page_start, :page_end, :text, CAST(:emb AS vector), :model)
+                    INSERT INTO rag_pdf_chunks (lesson_id, module_id, chunk_index, page_start, page_end, text, embedding, embedding_model, created_at)
+                    VALUES (:lesson_id, :module_id, :chunk_index, :page_start, :page_end, :text, CAST(:emb AS vector), :model, :created_at)
                     ON CONFLICT (lesson_id, chunk_index)
                     DO UPDATE SET text = EXCLUDED.text, embedding = EXCLUDED.embedding
                     """
@@ -282,6 +282,7 @@ async def _process_single_pdf(
                     "text": chunk["text"],
                     "emb": emb_literal,
                     "model": model,
+                    "created_at": now,
                 },
             )
 
