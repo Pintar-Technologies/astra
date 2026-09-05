@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     LANGFUSE_PUBLIC_KEY: str = ""
     LANGFUSE_SECRET_KEY: str = ""
     LANGFUSE_HOST: str = "https://cloud.langfuse.com"
-    OPENROUTER_MODEL: str = "nvidia/nemotron-3-ultra-550b-a55b:free"
+    OPENROUTER_MODEL: str = "openai/gpt-5.6-luna"
     EMBEDDING_MODEL: str = "text-embedding-3-small"
     APP_PORT: int = 8001
 
