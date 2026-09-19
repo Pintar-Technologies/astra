@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     LANGFUSE_HOST: str = "https://cloud.langfuse.com"
     OPENROUTER_MODEL: str = "openai/gpt-5.6-luna"
     EMBEDDING_MODEL: str = "text-embedding-3-small"
+    RAG_MIN_RETRIEVAL_SCORE: float = 0.40
     APP_PORT: int = 8001
 
 

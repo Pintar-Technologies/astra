@@ -116,7 +116,7 @@ async def _stream_events(
                         if token:
                             await queue.put(("token", token))
 
-                elif event_name == "on_chain_end" and name == "generate":
+                elif event_name == "on_chain_end" and name in {"generate", "generate_fallback"}:
                     output = data.get("output", {})
                     if isinstance(output, dict):
                         answer_text = output.get("answer", "")
