@@ -4,14 +4,15 @@ import sys
 from logging.config import fileConfig
 from pathlib import Path
 
-from alembic import context
 from sqlalchemy import engine_from_config, pool
+
+from alembic import context
 
 # Ensure the project root is on sys.path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from app.config import settings  # noqa: E402
-from app.models.schemas import Base  # noqa: E402
+from app.config import settings
+from app.models.schemas import Base
 
 config = context.config
 

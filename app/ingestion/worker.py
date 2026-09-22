@@ -23,7 +23,7 @@ redis_settings = RedisSettings(
 class WorkerSettings:
     """Arq worker configuration."""
 
-    cron_jobs = [
+    cron_jobs = [  # noqa: RUF012
         cron(embed_pending_segments, minute={0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55}, second={45}, keep_result=0),
         cron(embed_pending_pdfs, minute={0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55}, second={15}, keep_result=0),
     ]

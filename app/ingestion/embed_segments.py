@@ -8,12 +8,13 @@ from openai import RateLimitError
 from sqlalchemy import text
 
 from app.config import settings
-from app.deps import get_engine, get_brain_engine, get_openai_client
+from app.deps import get_brain_engine, get_engine, get_openai_client
 
 logger = logging.getLogger(__name__)
 
 _MAX_RETRIES = 3
 _BATCH_SIZE = 100
+BILLABLE_TO_USER = False
 
 
 async def embed_pending_segments(ctx: dict) -> int:
@@ -95,7 +96,7 @@ async def embed_pending_segments(ctx: dict) -> int:
         _update_logs_failed(engine, ids, "rate_limited")
         return 0
     except Exception as exc:
-        logger.exception("Failed to embed segments: %s", exc)
+        logger.exception("Failed to embed segments")
         _update_logs_failed(engine, ids, str(exc)[:500])
         return 0
 

@@ -4,8 +4,8 @@ import hashlib
 import logging
 from datetime import datetime, timezone
 
-import httpx
 import fitz  # PyMuPDF
+import httpx
 from openai import RateLimitError
 from sqlalchemy import text
 
@@ -20,6 +20,7 @@ _MAX_PDF_BYTES = 50 * 1024 * 1024  # 50 MB
 _CHUNK_SIZE_CHARS = 1200  # ~300 tokens
 _CHUNK_OVERLAP_CHARS = 240  # ~20% overlap
 _MIN_TEXT_CHARS = 50
+BILLABLE_TO_USER = False
 
 # Idempotent guard so the cron can't crash-loop if the alembic migration
 # hasn't created the rag_* tables yet. Mirrors 0001_initial_rag_tables.py.
@@ -129,7 +130,7 @@ async def embed_pending_pdfs(ctx: dict | None = None) -> int:
             if ok:
                 success_count += 1
         except Exception as exc:
-            logger.exception("Failed to process PDF for lesson %s: %s", lesson_id, exc)
+            logger.exception("Failed to process PDF for lesson %s", lesson_id)
             _mark_pdf_failed(engine, lesson_id, str(exc)[:500])
 
     logger.info("Successfully ingested %d/%d PDFs", success_count, len(rows))
@@ -157,10 +158,10 @@ async def _process_single_pdf(
             response.raise_for_status()
             data = response.content
     except Exception as exc:
-        raise Exception(f"download_failed: {exc}") from exc
+        raise Exception(f"download_failed: {exc}") from exc  # noqa: TRY002
 
     if len(data) > _MAX_PDF_BYTES:
-        raise Exception("pdf_too_large")
+        raise Exception("pdf_too_large")  # noqa: TRY002
 
     # SHA-256 hash for dedup
     pdf_hash = hashlib.sha256(data).hexdigest()
@@ -190,11 +191,11 @@ async def _process_single_pdf(
     try:
         doc = fitz.open(stream=data, filetype="pdf")
     except Exception as exc:
-        raise Exception(f"corrupt_pdf: {exc}") from exc
+        raise Exception(f"corrupt_pdf: {exc}") from exc  # noqa: TRY002
 
     if doc.needs_pass:
         doc.close()
-        raise Exception("need_password")
+        raise Exception("need_password")  # noqa: TRY002
 
     # Extract text with page numbers
     pages_text: list[tuple[int, str]] = []
@@ -211,7 +212,7 @@ async def _process_single_pdf(
 
     total_text = "\n".join(t for _, t in pages_text)
     if len(total_text) < _MIN_TEXT_CHARS:
-        raise Exception("no_text_extracted: scanned PDF? OCR not supported")
+        raise Exception("no_text_extracted: scanned PDF? OCR not supported")  # noqa: TRY002
 
     # Chunk: ~300 tokens / ~1200 chars with 20% overlap
     chunks: list[dict] = []
@@ -242,7 +243,7 @@ async def _process_single_pdf(
     # Assign chunk_index and merge adjacent same-page chunks
     merged = []
     for i, c in enumerate(chunks):
-        if merged and merged[-1]["page_start"] == c["page_start"] and merged[-1]["page_end"] == c["page_end"]:
+        if merged and merged[-1]["page_start"] == c["page_start"] and merged[-1]["page_end"] == c["page_end"]:  # noqa: SIM102
             if len(merged[-1]["text"]) + len(c["text"]) < _CHUNK_SIZE_CHARS * 1.5:
                 merged[-1]["text"] += " " + c["text"]
                 continue
@@ -256,9 +257,9 @@ async def _process_single_pdf(
         resp = client.embeddings.create(input=texts_to_embed, model=model)
         embeddings = [d.embedding for d in resp.data]
     except RateLimitError:
-        raise Exception("rate_limited")
+        raise Exception("rate_limited")  # noqa: TRY002
     except Exception as exc:
-        raise Exception(f"embedding_failed: {exc}") from exc
+        raise Exception(f"embedding_failed: {exc}") from exc  # noqa: TRY002
 
     # Insert chunks into rag_pdf_chunks
     with engine.begin() as conn:
