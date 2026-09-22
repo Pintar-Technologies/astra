@@ -4,7 +4,7 @@ import asyncio
 import json
 import logging
 import uuid
-from typing import AsyncGenerator
+from collections.abc import AsyncGenerator
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -15,10 +15,7 @@ from app.graph.build import build_graph
 from app.models.schemas import QueryRequest
 
 logger = logging.getLogger(__name__)
-
 router = APIRouter()
-
-# ── Auth dependency ────────────────────────────────────────────────────────
 
 
 async def verify_internal_key(internal_api_key: str = Header("", alias="INTERNAL_API_KEY")):
@@ -29,14 +26,17 @@ async def verify_internal_key(internal_api_key: str = Header("", alias="INTERNAL
     return internal_api_key
 
 
-# ── SSE helpers ────────────────────────────────────────────────────────────
-
-
 def _sse_frame(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False, default=str)}\n\n"
 
 
-# ── Streaming endpoint ─────────────────────────────────────────────────────
+def _empty_usage() -> dict[str, int]:
+    return {"input_tokens": 0, "output_tokens": 0, "reasoning_tokens": 0, "cache_read_tokens": 0, "cache_write_tokens": 0}
+
+
+def _add_usage(total: dict[str, int], event: dict) -> None:
+    for key in ("input_tokens", "output_tokens", "reasoning_tokens", "cache_read_tokens", "cache_write_tokens"):
+        total[key] += int(event.get(key, 0) or 0)
 
 
 @router.post("/rag/query")
@@ -46,138 +46,112 @@ async def rag_query(
     _auth: str = Depends(verify_internal_key),
 ):
     request_id = uuid.uuid4().hex
-    logger.info("RAG query request_id=%s video=%s module=%s", request_id, body.lesson_video_id, body.module_id)
-
+    logger.info("RAG query request_id=%s generation_id=%s video=%s", request_id, body.generation_id, body.lesson_video_id)
     graph: CompiledGraph = build_graph()
-
     inputs = {
         "question": body.question,
         "lesson_video_id": body.lesson_video_id,
-        "module_id": body.module_id if body.module_id else None,
+        "module_id": body.module_id,
         "session_history": body.session_history or [],
+        "generation_id": body.generation_id,
+        "user_id": body.user_id,
+        "routing": body.routing.model_dump(),
         "needs_broaden": False,
         "retrieved_docs": [],
         "graded_docs": [],
         "answer": "",
         "citations": [],
-        "tokens_used": {},
+        "tokens_used": _empty_usage(),
     }
-
     return StreamingResponse(
-        _stream_events(request_id, graph, inputs, request),
+        _stream_events(request_id, body.generation_id, graph, inputs, request),
         media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
     )
-
-
-# ── SSE event generator ────────────────────────────────────────────────────
 
 
 async def _stream_events(
     request_id: str,
+    generation_id: str,
     graph: CompiledGraph,
     inputs: dict,
     request: Request,
 ) -> AsyncGenerator[str, None]:
-    """Generate SSE frames for the RAG query."""
-    # Emit started
-    yield _sse_frame("started", {"event": "started", "request_id": request_id})
-
+    yield _sse_frame("started", {"event": "started", "request_id": request_id, "generation_id": generation_id})
     queue: asyncio.Queue = asyncio.Queue()
     answer_text = ""
     citations: list[dict] = []
-    tokens_used: dict = {}
-    model_name = settings.OPENROUTER_MODEL
+    aggregate_usage = _empty_usage()
+    model_name = inputs.get("routing", {}).get("answer", {}).get("model_id", "")
 
     async def _run_graph():
-        """Execute graph and push events to the queue."""
-        nonlocal answer_text, citations, tokens_used
+        nonlocal answer_text, citations
         try:
             async for event in graph.astream_events(inputs, version="v1"):
                 if request and await request.is_disconnected():
-                    break
-
+                    await queue.put(("cancelled", None))
+                    return
                 event_name = event.get("event", "")
                 name = event.get("name", "")
                 data = event.get("data", {})
-
                 if event_name == "on_chat_model_stream":
                     chunk = data.get("chunk")
-                    if chunk is not None:
-                        token = ""
-                        if hasattr(chunk, "content"):
-                            token = chunk.content or ""
-                        elif isinstance(chunk, dict):
-                            token = chunk.get("content", "")
-                        if token:
-                            await queue.put(("token", token))
-
-                elif event_name == "on_chain_end" and name in {"generate", "generate_fallback"}:
+                    token = ""
+                    if chunk is not None and hasattr(chunk, "content"):
+                        token = chunk.content or ""
+                    elif isinstance(chunk, dict):
+                        token = chunk.get("content", "")
+                    if token:
+                        await queue.put(("token", token))
+                elif event_name == "on_chain_end":
                     output = data.get("output", {})
                     if isinstance(output, dict):
-                        answer_text = output.get("answer", "")
-                        tokens_used = output.get("tokens_used", {})
-
-                elif event_name == "on_chain_end" and name == "cite":
-                    output = data.get("output", {})
-                    if isinstance(output, dict):
-                        citations = output.get("citations", [])
-
+                        usage_event = output.get("usage_event")
+                        if isinstance(usage_event, dict):
+                            await queue.put(("usage", usage_event))
+                        if name in {"generate", "generate_fallback"}:
+                            answer_text = output.get("answer", "")
+                        if name == "cite":
+                            citations = output.get("citations", [])
             await queue.put(("done", None))
-
         except Exception as exc:
             logger.exception("Graph execution failed for %s", request_id)
             await queue.put(("error", exc))
 
     task = asyncio.create_task(_run_graph())
-
     try:
         while True:
             try:
                 item = await asyncio.wait_for(queue.get(), timeout=30.0)
             except asyncio.TimeoutError:
-                # Heartbeat — no event for 30s
-                yield _sse_frame("heartbeat", {"event": "heartbeat"})
+                yield _sse_frame("heartbeat", {"event": "heartbeat", "request_id": request_id})
                 continue
-
             event_type, payload = item
-
             if event_type == "token":
-                yield _sse_frame("chunk", {
-                    "event": "chunk",
-                    "request_id": request_id,
-                    "content": payload,
-                })
-
+                yield _sse_frame("chunk", {"event": "chunk", "request_id": request_id, "content": payload})
+            elif event_type == "usage":
+                _add_usage(aggregate_usage, payload)
+                yield _sse_frame("usage", {"event": "usage", "request_id": request_id, **payload})
             elif event_type == "done":
-                final_answer = answer_text
                 yield _sse_frame("completed", {
-                    "event": "completed",
-                    "request_id": request_id,
-                    "answer": final_answer,
-                    "citations": citations,
-                    "model": model_name,
-                    "tokens_used": tokens_used,
+                    "event": "completed", "request_id": request_id, "generation_id": generation_id,
+                    "answer": answer_text, "citations": citations, "model": model_name,
+                    "usage": aggregate_usage, "tokens_used": aggregate_usage,
                 })
                 return
-
+            elif event_type == "cancelled":
+                yield _sse_frame("cancelled", {"event": "cancelled", "request_id": request_id, "generation_id": generation_id, "usage": aggregate_usage})
+                return
             elif event_type == "error":
                 raise payload
-
     except asyncio.CancelledError:
         logger.info("Stream cancelled for %s", request_id)
         task.cancel()
         return
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         logger.error("Stream error for %s: %s", request_id, str(exc))
         yield _sse_frame("error", {
-            "event": "error",
-            "request_id": request_id,
-            "message": "ASTI sedang istirahat sebentar, coba lagi ya Kakak!",
-            "error_code": "rag_error",
+            "event": "error", "request_id": request_id, "generation_id": generation_id,
+            "message": "ASTI sedang istirahat sebentar, coba lagi ya Kakak!", "error_code": "rag_error",
+            "usage": aggregate_usage,
         })
-        return
